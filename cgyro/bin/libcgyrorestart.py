@@ -327,6 +327,17 @@ class CGyroRestartData:
         import numpy as np
         np.save(fname, self.get_array())
 
+    def get_data(self):
+        import numpy as np
+        arr = self.get_array()                              # (nt, ns, nx, ne, nth, nr), complex128
+        arr_t = arr.transpose(1, 2, 3, 4, 5, 0)            # (ns, nx, ne, nth, nr, nt)
+        return np.stack([arr_t.real, arr_t.imag], axis=0)  # (2, ns, nx, ne, nth, nr, nt), float64
+        # Output dtype: float64, shape (2, N_SPECIES, N_XI, N_ENERGY, N_THETA, N_RADIAL, N_TOROIDAL)
+
+    def save_data(self, fname):
+        import numpy as np
+        np.save(fname, self.get_data())
+
 #
 # Class that writes a restart file from an array produced by CGyroRestartData.get_array()
 # and a CGyroRestartHeader (either loaded from a file or from a JSON metadata file).
@@ -334,7 +345,7 @@ class CGyroRestartData:
 class CGyroRestartWriter:
     def __init__(self):
         self.header = CGyroRestartHeader()
-        self.arr = None  # complex128, shape (n_toroidal, n_species, n_xi, n_energy, n_theta, n_radial)
+        self.arr = None  # float64, shape (2, N_SPECIES, N_XI, N_ENERGY, N_THETA, N_RADIAL, N_TOROIDAL)
 
     def load_array(self, fname):
         import numpy as np
@@ -360,23 +371,32 @@ class CGyroRestartWriter:
         import numpy as np
         g = self.header.grid
         f = self.header.fmt
-        nt, nv     = g.n_toroidal, g.get_nv()
-        nt_loc     = f.nt_loc
-        nv_loc     = f.nv_loc
-        nt_dim     = nt // nt_loc
-        nv_dim     = nv // nv_loc
-        nc         = g.get_nc()
+        nt, nv = g.n_toroidal, g.get_nv()
+        nt_loc, nv_loc = f.nt_loc, f.nv_loc
+        nt_dim = nt // nt_loc
+        nv_dim = nv // nv_loc
+        nc     = g.get_nc()
+
+        # Input: (2, ns, nx, ne, nth, nr, nt) float64
+        arr = self.arr[0] + 1j * self.arr[1]  # (ns, nx, ne, nth, nr, nt)
+
+        # Transpose 1: reorder to (nv_order..., nr, nth, nt) so that a single
+        # reshape can split all block/local dims at once.
+        #   velocity_order==1: iv = (ie*nx + ix)*ns + is_  -> order (ne, nx, ns)
+        #   velocity_order==2: iv = (is_*ne + ie)*nx + ix  -> order (ns, ne, nx)
+        # In both cases also swap nth<->nr so spatial C-order matches ic = ir*nth + ith.
         if f.velocity_order == 1:
-            # iv = (i_e * n_xi + i_x) * n_species + i_s  -> slow=n_e, mid=n_x, fast=n_s
-            arr_t = self.arr.transpose(0, 3, 2, 1, 5, 4)   # (nt, n_e, n_x, n_s, n_r, n_th)
+            arr = arr.transpose(2, 1, 0, 4, 3, 5)   # (ne, nx, ns, nr, nth, nt)
         elif f.velocity_order == 2:
-            # iv = (i_s * n_energy + i_e) * n_xi + i_x  -> slow=n_s, mid=n_e, fast=n_x
-            arr_t = self.arr.transpose(0, 1, 3, 2, 5, 4)   # (nt, n_s, n_e, n_x, n_r, n_th)
+            arr = arr.transpose(0, 2, 1, 4, 3, 5)   # (ns, ne, nx, nr, nth, nt)
         else:
             raise ValueError("Unknown velocity_order: %i" % f.velocity_order)
-        # (nt, nv_ordered, n_r, n_th) -> (nt_dim, nt_loc, nv_dim, nv_loc, nc) -> (nt_dim, nv_dim, nt_loc, nv_loc, nc)
-        internal = arr_t.reshape(nt_dim, nt_loc, nv_dim, nv_loc, nc)
-        return np.ascontiguousarray(internal.transpose(0, 2, 1, 3, 4))
+
+        # Single reshape: (nv, nc, nt) -> (nv_dim, nv_loc, nc, nt_dim, nt_loc)
+        # Transpose 2: -> (nt_dim, nv_dim, nt_loc, nv_loc, nc)
+        return np.ascontiguousarray(
+            arr.reshape(nv_dim, nv_loc, nc, nt_dim, nt_loc).transpose(3, 0, 4, 1, 2)
+        )
 
     def save_to_file(self, fname):
         raw_data = self._to_internal()
