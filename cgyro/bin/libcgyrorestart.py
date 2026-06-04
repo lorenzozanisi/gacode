@@ -196,6 +196,24 @@ class CGyroRestartHeader:
                 fd.write(v_b)
             fd.write(magic_b)
 
+    def save_metadata(self, fname):
+        import json
+        meta = {
+            'N_THETA':            self.grid.n_theta,
+            'N_RADIAL':           self.grid.n_radial,
+            'N_SPECIES':          self.grid.n_species,
+            'N_XI':               self.grid.n_xi,
+            'N_ENERGY':           self.grid.n_energy,
+            'N_TOROIDAL':         self.grid.n_toroidal,
+            'VELOCITY_ORDER':     self.fmt.velocity_order,
+            'TOROIDALS_PER_PROC': self.fmt.nt_loc,
+            'NV_LOC':             self.fmt.nv_loc,
+        }
+        for k in self.info_only_keys:
+            meta[k] = self.info_only[k]
+        with open(fname, 'w') as f:
+            json.dump(meta, f, indent=2)
+
     def get_thetabytes(self):
         return self.fmt.el_size*self.grid.n_theta
 
@@ -275,4 +293,95 @@ class CGyroRestartData:
     # all indexes are 0-based
     def el(self, i_tor, i_s, i_x, i_e, i_theta, i_r):
         return self.el_tvc(i_tor, self.header.get_iv(i_s, i_x, i_e), self.header.get_ic(i_theta, i_r))
+
+    def get_array(self):
+        import numpy as np
+        g = self.header.grid
+        f = self.header.fmt
+        nt, nv = g.n_toroidal, g.get_nv()
+        n_r, n_th = g.n_radial, g.n_theta
+        n_e, n_x, n_s = g.n_energy, g.n_xi, g.n_species
+
+        # Undo MPI block/local split for both toroidal and velocity axes,
+        # then split nc into (n_radial, n_theta).
+        # i_t = itm*nt_loc + itl  and  i_v = ivm*nv_loc + ivl  after transpose.
+        arr = (self.data
+               .transpose(0, 2, 1, 3, 4)     # (nt_dim, nt_loc, nv_dim, nv_loc, nc)
+               .reshape(nt, nv, n_r, n_th))  # (n_toroidal, nv, n_radial, n_theta)
+
+        if f.velocity_order == 1:
+            # iv = (i_e * n_xi + i_x) * n_species + i_s
+            arr = (arr.reshape(nt, n_e, n_x, n_s, n_r, n_th)
+                      .transpose(0, 3, 2, 1, 5, 4))
+        elif f.velocity_order == 2:
+            # iv = (i_s * n_energy + i_e) * n_xi + i_x
+            arr = (arr.reshape(nt, n_s, n_e, n_x, n_r, n_th)
+                      .transpose(0, 1, 3, 2, 5, 4))
+        else:
+            raise ValueError("Unknown velocity_order: %i" % f.velocity_order)
+
+        return np.ascontiguousarray(arr)
+        # Output: complex128, shape (n_toroidal, n_species, n_xi, n_energy, n_theta, n_radial)
+
+    def save_array(self, fname):
+        import numpy as np
+        np.save(fname, self.get_array())
+
+#
+# Class that writes a restart file from an array produced by CGyroRestartData.get_array()
+# and a CGyroRestartHeader (either loaded from a file or from a JSON metadata file).
+#
+class CGyroRestartWriter:
+    def __init__(self):
+        self.header = CGyroRestartHeader()
+        self.arr = None  # complex128, shape (n_toroidal, n_species, n_xi, n_energy, n_theta, n_radial)
+
+    def load_array(self, fname):
+        import numpy as np
+        self.arr = np.load(fname)
+
+    def load_metadata(self, fname):
+        import json
+        with open(fname) as f:
+            meta = json.load(f)
+        self.header.grid.load_from_dict(meta)
+        self.header.fmt.load_from_dict(meta)
+        if 'NV_LOC' in meta:
+            self.header.fmt.nv_loc = int(meta['NV_LOC'])
+        for k in self.header.info_only_keys:
+            if k in meta:
+                self.header.info_only[k] = int(meta[k])
+
+    def set_from_data(self, arr, header):
+        self.arr = arr
+        self.header = header
+
+    def _to_internal(self):
+        import numpy as np
+        g = self.header.grid
+        f = self.header.fmt
+        nt, nv     = g.n_toroidal, g.get_nv()
+        nt_loc     = f.nt_loc
+        nv_loc     = f.nv_loc
+        nt_dim     = nt // nt_loc
+        nv_dim     = nv // nv_loc
+        nc         = g.get_nc()
+        if f.velocity_order == 1:
+            # iv = (i_e * n_xi + i_x) * n_species + i_s  -> slow=n_e, mid=n_x, fast=n_s
+            arr_t = self.arr.transpose(0, 3, 2, 1, 5, 4)   # (nt, n_e, n_x, n_s, n_r, n_th)
+        elif f.velocity_order == 2:
+            # iv = (i_s * n_energy + i_e) * n_xi + i_x  -> slow=n_s, mid=n_e, fast=n_x
+            arr_t = self.arr.transpose(0, 1, 3, 2, 5, 4)   # (nt, n_s, n_e, n_x, n_r, n_th)
+        else:
+            raise ValueError("Unknown velocity_order: %i" % f.velocity_order)
+        # (nt, nv_ordered, n_r, n_th) -> (nt_dim, nt_loc, nv_dim, nv_loc, nc) -> (nt_dim, nv_dim, nt_loc, nv_loc, nc)
+        internal = arr_t.reshape(nt_dim, nt_loc, nv_dim, nv_loc, nc)
+        return np.ascontiguousarray(internal.transpose(0, 2, 1, 3, 4))
+
+    def save_to_file(self, fname):
+        raw_data = self._to_internal()
+        with open(fname, 'wb') as fd:
+            self.header.savev3(fd)
+            fd.write(b'\x00' * (header_size - fd.tell()))
+            raw_data.tofile(fd)
 
