@@ -16,7 +16,10 @@
 #   data.load_from_file('my/old/simulation/bin.cgyro.restart.old')
 #   print(data.el(11,0,6,2,13,32)) # Note: all indexes are 0-based
 #   print(data.el_tvc(11,38,781)) # Note: iv ordering depends on VELOCITY_ORDER
-#   
+#   # Vectorised access to the whole array:
+#   arr = data.get_array() # float64, shape (2, n_xi, n_energy, n_theta, n_radial, n_toroidal, n_species)
+#                          # arr[0]=real part, arr[1]=imag part
+#
 
 
 import sys,os
@@ -320,23 +323,16 @@ class CGyroRestartData:
         else:
             raise ValueError("Unknown velocity_order: %i" % f.velocity_order)
 
-        return np.ascontiguousarray(arr)
-        # Output: complex128, shape (n_toroidal, n_species, n_xi, n_energy, n_theta, n_radial)
+        # arr is now complex128, shape (nt, ns, nx, ne, nth, nr).
+        # New output convention: put species last, toroidal next-to-last, and split the
+        # complex dtype into a leading (real, imag) axis.
+        arr = arr.transpose(2, 3, 4, 5, 0, 1)          # (nx, ne, nth, nr, nt, ns)
+        return np.stack([arr.real, arr.imag], axis=0)  # (2, nx, ne, nth, nr, nt, ns), float64
+        # Output: float64, shape (2, N_XI, N_ENERGY, N_THETA, N_RADIAL, N_TOROIDAL, N_SPECIES)
 
     def save_array(self, fname):
         import numpy as np
         np.save(fname, self.get_array())
-
-    def get_data(self):
-        import numpy as np
-        arr = self.get_array()                              # (nt, ns, nx, ne, nth, nr), complex128
-        arr_t = arr.transpose(1, 2, 3, 4, 5, 0)            # (ns, nx, ne, nth, nr, nt)
-        return np.stack([arr_t.real, arr_t.imag], axis=0)  # (2, ns, nx, ne, nth, nr, nt), float64
-        # Output dtype: float64, shape (2, N_SPECIES, N_XI, N_ENERGY, N_THETA, N_RADIAL, N_TOROIDAL)
-
-    def save_data(self, fname):
-        import numpy as np
-        np.save(fname, self.get_data())
 
 #
 # Class that writes a restart file from an array produced by CGyroRestartData.get_array()
@@ -345,7 +341,7 @@ class CGyroRestartData:
 class CGyroRestartWriter:
     def __init__(self):
         self.header = CGyroRestartHeader()
-        self.arr = None  # float64, shape (2, N_SPECIES, N_XI, N_ENERGY, N_THETA, N_RADIAL, N_TOROIDAL)
+        self.arr = None  # float64, shape (2, N_XI, N_ENERGY, N_THETA, N_RADIAL, N_TOROIDAL, N_SPECIES)
 
     def load_array(self, fname):
         import numpy as np
@@ -377,8 +373,8 @@ class CGyroRestartWriter:
         nv_dim = nv // nv_loc
         nc     = g.get_nc()
 
-        # Input: (2, ns, nx, ne, nth, nr, nt) float64
-        arr = self.arr[0] + 1j * self.arr[1]  # (ns, nx, ne, nth, nr, nt)
+        # Input: (2, nx, ne, nth, nr, nt, ns) float64
+        arr = self.arr[0] + 1j * self.arr[1]  # (nx, ne, nth, nr, nt, ns)
 
         # Transpose 1: reorder to (nv_order..., nr, nth, nt) so that a single
         # reshape can split all block/local dims at once.
@@ -386,9 +382,9 @@ class CGyroRestartWriter:
         #   velocity_order==2: iv = (is_*ne + ie)*nx + ix  -> order (ns, ne, nx)
         # In both cases also swap nth<->nr so spatial C-order matches ic = ir*nth + ith.
         if f.velocity_order == 1:
-            arr = arr.transpose(2, 1, 0, 4, 3, 5)   # (ne, nx, ns, nr, nth, nt)
+            arr = arr.transpose(1, 0, 5, 3, 2, 4)   # (ne, nx, ns, nr, nth, nt)
         elif f.velocity_order == 2:
-            arr = arr.transpose(0, 2, 1, 4, 3, 5)   # (ns, ne, nx, nr, nth, nt)
+            arr = arr.transpose(5, 1, 0, 3, 2, 4)   # (ns, ne, nx, nr, nth, nt)
         else:
             raise ValueError("Unknown velocity_order: %i" % f.velocity_order)
 
